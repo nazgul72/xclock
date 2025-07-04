@@ -7,6 +7,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use chrono::Datelike;
 use winapi::ctypes::c_int;
 use winapi::shared::minwindef::{BOOL, LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HBRUSH, HWND, POINT, RECT};
@@ -317,13 +318,37 @@ unsafe extern "system" fn tooltip_window_proc(
             
             // Get current time info
             let now = std::time::SystemTime::now();
-            let duration = now.duration_since(std::time::UNIX_EPOCH).unwrap();
+            let boot_time = std::time::SystemTime::now() - std::time::Duration::from_millis(GetTickCount() as u64);
+            let uptime = now.duration_since(boot_time).unwrap_or_default();
+            
+            // Calculate Norwegian week number using chrono
+            let local_now = chrono::Local::now();
+            
+            // Norwegian week numbering follows ISO 8601:
+            // Week 1 is the first week with at least 4 days in the new year
+            // Week starts on Monday
+            let week_number = local_now.iso_week().week();
+            let year = local_now.iso_week().year();
+            
+            // Format uptime nicely
+            let uptime_secs = uptime.as_secs();
+            let days = uptime_secs / 86400;
+            let hours = (uptime_secs % 86400) / 3600;
+            let minutes = (uptime_secs % 3600) / 60;
+            
+            let uptime_text = if days > 0 {
+                format!("{}d {}h {}m", days, hours, minutes)
+            } else if hours > 0 {
+                format!("{}h {}m", hours, minutes)
+            } else {
+                format!("{}m", minutes)
+            };
             
             let text = format!(
-                "Unix Time: {}\nUptime: {}s\nTick Count: {}",
-                duration.as_secs(),
-                duration.as_secs(),
-                GetTickCount()
+                "Uptime: {}\nWeek {}, {} (NO)",
+                uptime_text,
+                week_number,
+                year
             );
             
             let text_wide = to_wide_string(&text);
