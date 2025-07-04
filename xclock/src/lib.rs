@@ -9,12 +9,12 @@ use std::sync::{Mutex, OnceLock};
 
 use chrono::Datelike;
 use winapi::ctypes::c_int;
-use winapi::shared::minwindef::{BOOL, LPARAM, LRESULT, UINT, WPARAM};
+use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HBRUSH, HWND, POINT, RECT};
 use winapi::um::libloaderapi::GetModuleHandleW;
-
 use winapi::um::sysinfoapi::GetTickCount;
 use winapi::um::winuser::*;
+use winapi::um::wingdi::*;
 
 // Newtype wrapper for HWND to allow Send/Sync implementations
 #[derive(Copy, Clone)]
@@ -29,6 +29,8 @@ static HOOK_HANDLE: AtomicPtr<winapi::shared::windef::HHOOK__> = AtomicPtr::new(
 static TOOLTIP_WINDOW: AtomicPtr<winapi::shared::windef::HWND__> = AtomicPtr::new(ptr::null_mut());
 static CLOCK_WINDOWS: OnceLock<Mutex<Vec<SafeHwnd>>> = OnceLock::new();
 static RUNNING: AtomicBool = AtomicBool::new(true);
+static TOOLTIP_VISIBLE: AtomicBool = AtomicBool::new(false);
+static LAST_MOUSE_POS: OnceLock<Mutex<POINT>> = OnceLock::new();
 
 const TOOLTIP_CLASS_NAME: &str = "ClockHoverTooltip";
 
@@ -42,7 +44,7 @@ fn from_wide_string(wide: &[u16]) -> String {
 
 unsafe fn get_window_class_name(hwnd: HWND) -> String {
     let mut buffer = [0u16; 256];
-    let len = unsafe { GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    let len = GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
     if len > 0 {
         from_wide_string(&buffer[..len as usize])
     } else {
@@ -50,7 +52,45 @@ unsafe fn get_window_class_name(hwnd: HWND) -> String {
     }
 }
 
-// Find the actual clock control within TrayNotifyWnd
+// Generate tooltip text with uptime and Norwegian week number
+fn generate_tooltip_text() -> String {
+    // Get current time info
+    let now = std::time::SystemTime::now();
+    let boot_time = std::time::SystemTime::now() - std::time::Duration::from_millis(unsafe { GetTickCount() } as u64);
+    let uptime = now.duration_since(boot_time).unwrap_or_default();
+    
+    // Calculate Norwegian week number using chrono
+    let local_now = chrono::Local::now();
+    
+    // Norwegian week numbering follows ISO 8601:
+    // Week 1 is the first week with at least 4 days in the new year
+    // Week starts on Monday
+    let week_number = local_now.iso_week().week();
+    let year = local_now.iso_week().year();
+    
+    // Format uptime nicely
+    let uptime_secs = uptime.as_secs();
+    let days = uptime_secs / 86400;
+    let hours = (uptime_secs % 86400) / 3600;
+    let minutes = (uptime_secs % 3600) / 60;
+    
+    let uptime_text = if days > 0 {
+        format!("{}d {}h {}m", days, hours, minutes)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, minutes)
+    } else {
+        format!("{}m", minutes)
+    };
+    
+    format!(
+        "Uptime: {}\nWeek {}, {} (NO)",
+        uptime_text,
+        week_number,
+        year
+    )
+}
+
+// Find all potential clock windows
 unsafe fn find_all_clock_windows() -> Vec<HWND> {
     let mut candidates = Vec::new();
     
@@ -72,7 +112,7 @@ unsafe fn find_all_clock_windows() -> Vec<HWND> {
         if !notification_area.is_null() {
             println!("Found notification area: TrayNotifyWnd -> {:?}", notification_area);
             
-            // Now search for the actual clock control within TrayNotifyWnd
+            // Search for actual clock controls
             let clock_classes = ["TrayClockWClass", "ClockWClass", "DigitalClockWClass"];
             
             for clock_class in &clock_classes {
@@ -89,84 +129,10 @@ unsafe fn find_all_clock_windows() -> Vec<HWND> {
                 }
             }
             
-            // If no specific clock class found, enumerate children to find clock controls
+            // If no specific clock control found, use notification area as fallback
             if candidates.is_empty() {
-                println!("No direct clock class found, searching children of TrayNotifyWnd...");
-                
-                extern "system" fn enum_notification_children(hwnd: HWND, lparam: LPARAM) -> BOOL {
-                    let candidates = lparam as *mut Vec<HWND>;
-                    unsafe {
-                        let class_name = get_window_class_name(hwnd);
-                        
-                        println!("  Child: {} -> {:?}", class_name, hwnd);
-                        
-                        // Look for any control that might be the clock
-                        if class_name.to_lowercase().contains("clock") ||
-                           class_name.to_lowercase().contains("time") ||
-                           class_name == "Button" ||
-                           class_name == "Static" ||
-                           class_name == "ToolbarWindow32" {
-                            println!("    -> Adding as clock candidate");
-                            (*candidates).push(hwnd);
-                        }
-                    }
-                    1 // TRUE
-                }
-                
-                EnumChildWindows(
-                    notification_area,
-                    Some(enum_notification_children),
-                    &mut candidates as *mut Vec<HWND> as LPARAM,
-                );
-            }
-            
-            // If still no specific control found, use a targeted approach
-            if candidates.is_empty() {
-                println!("No specific clock control found, using notification area with position filtering");
-                // We'll use the notification area but with more precise position detection
+                println!("No specific clock control found, using notification area");
                 candidates.push(notification_area);
-            }
-        } else {
-            println!("WARNING: TrayNotifyWnd not found in taskbar");
-        }
-    } else {
-        println!("WARNING: Shell_TrayWnd taskbar not found");
-    }
-    
-    // Also check secondary taskbar for multi-monitor setups
-    let secondary_taskbar = FindWindowW(to_wide_string("Shell_SecondaryTrayWnd").as_ptr(), ptr::null());
-    if !secondary_taskbar.is_null() {
-        println!("Found secondary taskbar: Shell_SecondaryTrayWnd");
-        
-        let secondary_notification = FindWindowExW(
-            secondary_taskbar,
-            ptr::null_mut(),
-            to_wide_string("TrayNotifyWnd").as_ptr(),
-            ptr::null(),
-        );
-        
-        if !secondary_notification.is_null() {
-            println!("Found secondary notification area: TrayNotifyWnd -> {:?}", secondary_notification);
-            
-            // Search for clock control in secondary notification area
-            let clock_classes = ["TrayClockWClass", "ClockWClass", "DigitalClockWClass"];
-            
-            for clock_class in &clock_classes {
-                let clock = FindWindowExW(
-                    secondary_notification,
-                    ptr::null_mut(),
-                    to_wide_string(clock_class).as_ptr(),
-                    ptr::null(),
-                );
-                
-                if !clock.is_null() {
-                    println!("Found secondary clock control: {} -> {:?}", clock_class, clock);
-                    candidates.push(clock);
-                }
-            }
-            
-            if candidates.len() == 1 {  // Only primary found, no secondary clock found
-                candidates.push(secondary_notification);
             }
         }
     }
@@ -175,9 +141,8 @@ unsafe fn find_all_clock_windows() -> Vec<HWND> {
     candidates
 }
 
-// Check if point is inside the actual clock control
+// Check if point is inside any clock control
 unsafe fn is_point_in_any_clock(x: i32, y: i32) -> bool {
-    // Check known clock control windows first
     if let Some(clock_windows) = CLOCK_WINDOWS.get() {
         if let Ok(windows) = clock_windows.lock() {
             for &clock_hwnd in windows.iter() {
@@ -199,16 +164,10 @@ unsafe fn is_point_in_any_clock(x: i32, y: i32) -> bool {
                     else if class_name == "TrayNotifyWnd" {
                         // Only trigger in the right portion of TrayNotifyWnd (where clock usually is)
                         let width = rect.right - rect.left;
-                        let clock_area_left = rect.left + (width * 2 / 3);  // Right third of notification area
+                        let clock_area_left = rect.left + (width * 2 / 3);  // Right third
                         
                         if x >= clock_area_left && x <= rect.right && 
                            y >= rect.top && y <= rect.bottom {
-                            return true;
-                        }
-                    }
-                    // For other controls (Button, Static, etc.), use exact bounds
-                    else {
-                        if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
                             return true;
                         }
                     }
@@ -217,27 +176,43 @@ unsafe fn is_point_in_any_clock(x: i32, y: i32) -> bool {
         }
     }
     
-    // Enhanced fallback: Use WindowFromPoint to check for specific clock controls
-    let point = POINT { x, y };
-    let hwnd = WindowFromPoint(point);
-    
-    if !hwnd.is_null() {
-        let class_name = get_window_class_name(hwnd);
-        
-        // Only trigger for known clock-related controls
-        if class_name.contains("Clock") || 
-           class_name.contains("Time") ||
-           class_name == "TrayClockWClass" ||
-           class_name == "ClockWClass" ||
-           class_name == "DigitalClockWClass" {
-            return true;
-        }
-    }
-    
     false
 }
 
+// Hide any existing native tooltips in the area
+unsafe fn hide_native_tooltips() {
+    // Find and hide tooltip windows that might be showing
+    let tooltip_classes = ["tooltips_class32", "SysTooltip32"];
+    
+    for tooltip_class in &tooltip_classes {
+        let mut hwnd = FindWindowW(to_wide_string(tooltip_class).as_ptr(), ptr::null());
+        while !hwnd.is_null() {
+            if IsWindowVisible(hwnd) != 0 {
+                // Check if this tooltip is for the clock area
+                let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                if GetWindowRect(hwnd, &mut rect) != 0 {
+                    // Hide tooltips that appear in the taskbar area
+                    if rect.bottom > 1000 {  // Assuming taskbar is at bottom
+                        ShowWindow(hwnd, SW_HIDE);
+                    }
+                }
+            }
+            
+            hwnd = FindWindowExW(ptr::null_mut(), hwnd, to_wide_string(tooltip_class).as_ptr(), ptr::null());
+        }
+    }
+}
+
+// Show our custom tooltip
 unsafe fn show_tooltip(x: i32, y: i32) {
+    // Don't show multiple tooltips
+    if TOOLTIP_VISIBLE.load(Ordering::SeqCst) {
+        return;
+    }
+    
+    // Hide any native tooltips first
+    hide_native_tooltips();
+    
     let current_tooltip = TOOLTIP_WINDOW.load(Ordering::SeqCst);
     if !current_tooltip.is_null() {
         return;
@@ -245,16 +220,39 @@ unsafe fn show_tooltip(x: i32, y: i32) {
 
     let class_name = to_wide_string(TOOLTIP_CLASS_NAME);
     let window_name = to_wide_string("Extended Clock Info");
+    let tooltip_text = generate_tooltip_text();
     
+    // Calculate tooltip size based on text
+    let text_lines = tooltip_text.lines().count() as i32;
+    let max_line_length = tooltip_text.lines().map(|l| l.len()).max().unwrap_or(0) as i32;
+    
+    let tooltip_width = std::cmp::max(250, max_line_length * 8);
+    let tooltip_height = std::cmp::max(60, text_lines * 16 + 20);
+    
+    // Position tooltip near cursor but avoid screen edges
+    let screen_width = GetSystemMetrics(SM_CXSCREEN);
+    
+    let mut tooltip_x = x + 15;
+    let mut tooltip_y = y - tooltip_height - 10;
+    
+    // Adjust if tooltip would go off screen
+    if tooltip_x + tooltip_width > screen_width {
+        tooltip_x = x - tooltip_width - 15;
+    }
+    if tooltip_y < 0 {
+        tooltip_y = y + 25;
+    }
+    
+    // Create tooltip window
     let tooltip = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         class_name.as_ptr(),
         window_name.as_ptr(),
-        WS_POPUP | WS_BORDER,
-        x + 15,
-        y - 120,
-        280,
-        100,
+        WS_POPUP,
+        tooltip_x,
+        tooltip_y,
+        tooltip_width,
+        tooltip_height,
         ptr::null_mut(),
         ptr::null_mut(),
         GetModuleHandleW(ptr::null()),
@@ -263,33 +261,67 @@ unsafe fn show_tooltip(x: i32, y: i32) {
 
     if !tooltip.is_null() {
         TOOLTIP_WINDOW.store(tooltip, Ordering::SeqCst);
+        TOOLTIP_VISIBLE.store(true, Ordering::SeqCst);
         ShowWindow(tooltip, SW_SHOW);
         UpdateWindow(tooltip);
+        
+        // Set a timer to hide the tooltip after some time
+        SetTimer(tooltip, 1, 5000, None); // Hide after 5 seconds
     }
 }
 
+// Hide our custom tooltip
 unsafe fn hide_tooltip() {
     let current_tooltip = TOOLTIP_WINDOW.load(Ordering::SeqCst);
     if !current_tooltip.is_null() {
         DestroyWindow(current_tooltip);
         TOOLTIP_WINDOW.store(ptr::null_mut(), Ordering::SeqCst);
+        TOOLTIP_VISIBLE.store(false, Ordering::SeqCst);
     }
 }
 
+// Mouse hook procedure
 unsafe extern "system" fn mouse_hook_proc(
     code: c_int,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if code >= 0 && wparam as u32 == WM_MOUSEMOVE {
-        let mouse_struct = *(lparam as *const MOUSEHOOKSTRUCT);
-        let x = mouse_struct.pt.x;
-        let y = mouse_struct.pt.y;
+    if code >= 0 {
+        match wparam as u32 {
+            WM_MOUSEMOVE => {
+                let mouse_struct = *(lparam as *const MOUSEHOOKSTRUCT);
+                let x = mouse_struct.pt.x;
+                let y = mouse_struct.pt.y;
 
-        if is_point_in_any_clock(x, y) {
-            show_tooltip(x, y);
-        } else {
-            hide_tooltip();
+                // Update last mouse position
+                if let Some(last_pos) = LAST_MOUSE_POS.get() {
+                    if let Ok(mut pos) = last_pos.lock() {
+                        pos.x = x;
+                        pos.y = y;
+                    }
+                }
+
+                if is_point_in_any_clock(x, y) {
+                    // Show tooltip after delay
+                    if !TOOLTIP_VISIBLE.load(Ordering::SeqCst) {
+                        // Small delay before showing tooltip (to mimic native behavior)
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        
+                        // Check if mouse is still in the clock area
+                        if is_point_in_any_clock(x, y) {
+                            show_tooltip(x, y);
+                        }
+                    }
+                } else {
+                    // Hide tooltip when mouse leaves clock area
+                    hide_tooltip();
+                }
+            }
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+                // Hide tooltip on any mouse click
+                hide_tooltip();
+            }
+            _ => {}
         }
     }
 
@@ -297,6 +329,7 @@ unsafe extern "system" fn mouse_hook_proc(
     CallNextHookEx(hook, code, wparam, lparam)
 }
 
+// Tooltip window procedure
 unsafe extern "system" fn tooltip_window_proc(
     hwnd: HWND,
     msg: UINT,
@@ -316,46 +349,42 @@ unsafe extern "system" fn tooltip_window_proc(
             
             let hdc = BeginPaint(hwnd, &mut ps);
             
-            // Get current time info
-            let now = std::time::SystemTime::now();
-            let boot_time = std::time::SystemTime::now() - std::time::Duration::from_millis(GetTickCount() as u64);
-            let uptime = now.duration_since(boot_time).unwrap_or_default();
+            // Get window rect for drawing
+            let mut window_rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            GetClientRect(hwnd, &mut window_rect);
             
-            // Calculate Norwegian week number using chrono
-            let local_now = chrono::Local::now();
+            // Draw native-style border
+            let border_pen = CreatePen(PS_SOLID as i32, 1, 0x808080);
+            let old_pen = SelectObject(hdc, border_pen as *mut _);
+            let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH as i32));
             
-            // Norwegian week numbering follows ISO 8601:
-            // Week 1 is the first week with at least 4 days in the new year
-            // Week starts on Monday
-            let week_number = local_now.iso_week().week();
-            let year = local_now.iso_week().year();
+            Rectangle(hdc, 0, 0, window_rect.right, window_rect.bottom);
             
-            // Format uptime nicely
-            let uptime_secs = uptime.as_secs();
-            let days = uptime_secs / 86400;
-            let hours = (uptime_secs % 86400) / 3600;
-            let minutes = (uptime_secs % 3600) / 60;
+            SelectObject(hdc, old_pen);
+            SelectObject(hdc, old_brush);
+            DeleteObject(border_pen as *mut _);
             
-            let uptime_text = if days > 0 {
-                format!("{}d {}h {}m", days, hours, minutes)
-            } else if hours > 0 {
-                format!("{}h {}m", hours, minutes)
-            } else {
-                format!("{}m", minutes)
+            // Draw text
+            let text = generate_tooltip_text();
+            let text_wide = to_wide_string(&text);
+            let mut text_rect = RECT { 
+                left: 8, 
+                top: 8, 
+                right: window_rect.right - 8, 
+                bottom: window_rect.bottom - 8 
             };
             
-            let text = format!(
-                "Uptime: {}\nWeek {}, {} (NO)",
-                uptime_text,
-                week_number,
-                year
-            );
+            // Set text color and background
+            SetTextColor(hdc, 0x000000); // Black text
+            SetBkMode(hdc, TRANSPARENT as i32);
             
-            let text_wide = to_wide_string(&text);
-            let mut rect = RECT { left: 10, top: 10, right: 270, bottom: 90 };
-            
-            DrawTextW(hdc, text_wide.as_ptr(), -1, &mut rect, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            DrawTextW(hdc, text_wide.as_ptr(), -1, &mut text_rect, DT_LEFT | DT_TOP | DT_WORDBREAK);
             EndPaint(hwnd, &ps);
+            0
+        }
+        WM_TIMER => {
+            // Hide tooltip when timer expires
+            hide_tooltip();
             0
         }
         WM_DESTROY => 0,
@@ -363,11 +392,12 @@ unsafe extern "system" fn tooltip_window_proc(
     }
 }
 
+// Register tooltip window class
 unsafe fn register_tooltip_class() -> bool {
     let class_name = to_wide_string(TOOLTIP_CLASS_NAME);
     
     let wc = WNDCLASSW {
-        style: 0,
+        style: CS_DROPSHADOW,
         lpfnWndProc: Some(tooltip_window_proc),
         cbClsExtra: 0,
         cbWndExtra: 0,
@@ -382,6 +412,7 @@ unsafe fn register_tooltip_class() -> bool {
     RegisterClassW(&wc) != 0
 }
 
+// Install mouse hook
 unsafe fn install_hook() -> bool {
     let hook = SetWindowsHookExW(
         WH_MOUSE_LL,
@@ -398,6 +429,7 @@ unsafe fn install_hook() -> bool {
     }
 }
 
+// Remove mouse hook
 unsafe fn remove_hook() {
     let hook = HOOK_HANDLE.load(Ordering::SeqCst);
     if !hook.is_null() {
@@ -409,15 +441,17 @@ unsafe fn remove_hook() {
 // Public API for the xclock library
 pub fn start_clock_hook() -> Result<(), String> {
     unsafe {
+        // Initialize last mouse position
+        let _ = LAST_MOUSE_POS.set(Mutex::new(POINT { x: 0, y: 0 }));
+        
         // Find all potential clock windows and store them
         let clock_windows = find_all_clock_windows();
         let _ = CLOCK_WINDOWS.set(Mutex::new(clock_windows.clone().into_iter().map(|hwnd| SafeHwnd(hwnd)).collect::<Vec<_>>()));
         
         if clock_windows.is_empty() {
-            println!("WARNING: No clock windows found!");
-            println!("The hook will still work but may not detect the clock area correctly.");
+            return Err("No clock windows found! Cannot install tooltip replacement.".to_string());
         } else {
-            println!("Monitoring {} potential clock windows", clock_windows.len());
+            println!("Found {} potential clock windows", clock_windows.len());
         }
 
         if !register_tooltip_class() {
@@ -429,7 +463,8 @@ pub fn start_clock_hook() -> Result<(), String> {
         }
 
         RUNNING.store(true, Ordering::SeqCst);
-        println!("Hook installed successfully. Hover over the system clock area...");
+        println!("Tooltip replacement installed successfully. Native tooltips will be replaced.");
+        println!("Hover over the system clock to see extended information!");
         Ok(())
     }
 }
@@ -440,7 +475,7 @@ pub fn stop_clock_hook() {
         remove_hook();
     }
     RUNNING.store(false, Ordering::SeqCst);
-    println!("Clock hook stopped.");
+    println!("Clock tooltip replacement stopped.");
 }
 
 pub fn is_hook_running() -> bool {
