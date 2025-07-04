@@ -1,0 +1,9 @@
+[package]
+name = "xclock-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+xclock = { path = "../xclock" }
+ctrlc = "3.0"
+
