@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use winapi::ctypes::c_int;
-use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
+use winapi::shared::minwindef::{BOOL, LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HBRUSH, HWND, POINT, RECT};
 use winapi::um::libloaderapi::GetModuleHandleW;
 
@@ -49,11 +49,11 @@ unsafe fn get_window_class_name(hwnd: HWND) -> String {
     }
 }
 
-// Find the Windows 11 clock area (TrayNotifyWnd)
+// Find the actual clock control within TrayNotifyWnd
 unsafe fn find_all_clock_windows() -> Vec<HWND> {
     let mut candidates = Vec::new();
     
-    println!("Searching for Windows 11 clock area...");
+    println!("Searching for Windows 11 clock control...");
     
     // Find the main taskbar
     let taskbar = FindWindowW(to_wide_string("Shell_TrayWnd").as_ptr(), ptr::null());
@@ -70,7 +70,61 @@ unsafe fn find_all_clock_windows() -> Vec<HWND> {
         
         if !notification_area.is_null() {
             println!("Found notification area: TrayNotifyWnd -> {:?}", notification_area);
-            candidates.push(notification_area);
+            
+            // Now search for the actual clock control within TrayNotifyWnd
+            let clock_classes = ["TrayClockWClass", "ClockWClass", "DigitalClockWClass"];
+            
+            for clock_class in &clock_classes {
+                let clock = FindWindowExW(
+                    notification_area,
+                    ptr::null_mut(),
+                    to_wide_string(clock_class).as_ptr(),
+                    ptr::null(),
+                );
+                
+                if !clock.is_null() {
+                    println!("Found clock control: {} -> {:?}", clock_class, clock);
+                    candidates.push(clock);
+                }
+            }
+            
+            // If no specific clock class found, enumerate children to find clock controls
+            if candidates.is_empty() {
+                println!("No direct clock class found, searching children of TrayNotifyWnd...");
+                
+                extern "system" fn enum_notification_children(hwnd: HWND, lparam: LPARAM) -> BOOL {
+                    let candidates = lparam as *mut Vec<HWND>;
+                    unsafe {
+                        let class_name = get_window_class_name(hwnd);
+                        
+                        println!("  Child: {} -> {:?}", class_name, hwnd);
+                        
+                        // Look for any control that might be the clock
+                        if class_name.to_lowercase().contains("clock") ||
+                           class_name.to_lowercase().contains("time") ||
+                           class_name == "Button" ||
+                           class_name == "Static" ||
+                           class_name == "ToolbarWindow32" {
+                            println!("    -> Adding as clock candidate");
+                            (*candidates).push(hwnd);
+                        }
+                    }
+                    1 // TRUE
+                }
+                
+                EnumChildWindows(
+                    notification_area,
+                    Some(enum_notification_children),
+                    &mut candidates as *mut Vec<HWND> as LPARAM,
+                );
+            }
+            
+            // If still no specific control found, use a targeted approach
+            if candidates.is_empty() {
+                println!("No specific clock control found, using notification area with position filtering");
+                // We'll use the notification area but with more precise position detection
+                candidates.push(notification_area);
+            }
         } else {
             println!("WARNING: TrayNotifyWnd not found in taskbar");
         }
@@ -92,17 +146,37 @@ unsafe fn find_all_clock_windows() -> Vec<HWND> {
         
         if !secondary_notification.is_null() {
             println!("Found secondary notification area: TrayNotifyWnd -> {:?}", secondary_notification);
-            candidates.push(secondary_notification);
+            
+            // Search for clock control in secondary notification area
+            let clock_classes = ["TrayClockWClass", "ClockWClass", "DigitalClockWClass"];
+            
+            for clock_class in &clock_classes {
+                let clock = FindWindowExW(
+                    secondary_notification,
+                    ptr::null_mut(),
+                    to_wide_string(clock_class).as_ptr(),
+                    ptr::null(),
+                );
+                
+                if !clock.is_null() {
+                    println!("Found secondary clock control: {} -> {:?}", clock_class, clock);
+                    candidates.push(clock);
+                }
+            }
+            
+            if candidates.len() == 1 {  // Only primary found, no secondary clock found
+                candidates.push(secondary_notification);
+            }
         }
     }
     
-    println!("Found {} clock areas", candidates.len());
+    println!("Found {} clock controls", candidates.len());
     candidates
 }
 
-// Check if point is inside the TrayNotifyWnd clock area
+// Check if point is inside the actual clock control
 unsafe fn is_point_in_any_clock(x: i32, y: i32) -> bool {
-    // Check known TrayNotifyWnd windows
+    // Check known clock control windows first
     if let Some(clock_windows) = CLOCK_WINDOWS.get() {
         if let Ok(windows) = clock_windows.lock() {
             for &clock_hwnd in windows.iter() {
@@ -112,23 +186,49 @@ unsafe fn is_point_in_any_clock(x: i32, y: i32) -> bool {
                 
                 let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
                 if GetWindowRect(clock_hwnd.0, &mut rect) != 0 {
-                    if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
-                        return true;
+                    let class_name = get_window_class_name(clock_hwnd.0);
+                    
+                    // If it's a specific clock control, use exact bounds
+                    if class_name.contains("Clock") || class_name.contains("Time") {
+                        if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                            return true;
+                        }
+                    }
+                    // If it's TrayNotifyWnd (fallback), be more restrictive
+                    else if class_name == "TrayNotifyWnd" {
+                        // Only trigger in the right portion of TrayNotifyWnd (where clock usually is)
+                        let width = rect.right - rect.left;
+                        let clock_area_left = rect.left + (width * 2 / 3);  // Right third of notification area
+                        
+                        if x >= clock_area_left && x <= rect.right && 
+                           y >= rect.top && y <= rect.bottom {
+                            return true;
+                        }
+                    }
+                    // For other controls (Button, Static, etc.), use exact bounds
+                    else {
+                        if x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom {
+                            return true;
+                        }
                     }
                 }
             }
         }
     }
     
-    // Fallback: Check if we're over TrayNotifyWnd directly
+    // Enhanced fallback: Use WindowFromPoint to check for specific clock controls
     let point = POINT { x, y };
     let hwnd = WindowFromPoint(point);
     
     if !hwnd.is_null() {
         let class_name = get_window_class_name(hwnd);
         
-        // Only trigger for TrayNotifyWnd
-        if class_name == "TrayNotifyWnd" {
+        // Only trigger for known clock-related controls
+        if class_name.contains("Clock") || 
+           class_name.contains("Time") ||
+           class_name == "TrayClockWClass" ||
+           class_name == "ClockWClass" ||
+           class_name == "DigitalClockWClass" {
             return true;
         }
     }
