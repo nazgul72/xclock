@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-winapi = { version = "0.3", features = ["winuser", "libloaderapi", "sysinfoapi", "minwindef", "windef"] }
+winapi = { version = "0.3", features = ["winuser", "libloaderapi", "sysinfoapi", "minwindef", "windef", "debugapi", "errhandlingapi"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 [profile.release]
