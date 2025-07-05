@@ -454,3 +454,11 @@ dependencies = [
  "ctrlc",
  "xclock",
 ]
+
+[[package]]
+name = "xclock-hook"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "winapi",
+]

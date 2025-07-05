@@ -1,0 +1,14 @@
+[package]
+name = "xclock-hook"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+winapi = { version = "0.3", features = ["winuser", "libloaderapi", "sysinfoapi", "minwindef", "windef"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+panic = "abort"

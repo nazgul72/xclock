@@ -5,4 +5,5 @@ resolver = "3"
 members = [
     "xclock",
     "xclock-cli",
+    "xclock-hook",
 ]

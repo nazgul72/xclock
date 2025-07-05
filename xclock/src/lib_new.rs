@@ -23,24 +23,14 @@ unsafe fn load_hook_dll() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(()); // Already loaded
     }
 
-    // Try different possible paths for the DLL
-    let dll_paths = [
-        "xclock_hook.dll",                    // Current directory
-        "target\\release\\xclock_hook.dll",   // Build directory
-        "..\\target\\release\\xclock_hook.dll", // Parent build directory
-    ];
-
-    for dll_path in &dll_paths {
-        let dll_name = to_wide_string(dll_path);
-        HOOK_DLL = LoadLibraryW(dll_name.as_ptr());
-        
-        if !HOOK_DLL.is_null() {
-            println!("Loaded DLL from: {}", dll_path);
-            return Ok(());
-        }
-    }
+    let dll_name = to_wide_string("xclock_hook.dll");
+    HOOK_DLL = LoadLibraryW(dll_name.as_ptr());
     
-    Err("Failed to load xclock_hook.dll from any location".into())
+    if HOOK_DLL.is_null() {
+        return Err("Failed to load xclock_hook.dll".into());
+    }
+
+    Ok(())
 }
 
 unsafe fn unload_hook_dll() {

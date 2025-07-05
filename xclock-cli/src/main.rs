@@ -46,22 +46,24 @@ fn main() {
             }).expect("Error setting Ctrl+C handler");
 
             // Start the hook
-            match xclock::start_clock_hook() {
+            match xclock::start_monitoring() {
                 Ok(()) => {
                     println!("Hook started successfully!");
                     println!("Hover over the system clock to see extended information.");
                     println!("Press Ctrl+C to exit.");
                     
                     // Main message loop
-                    while running.load(Ordering::SeqCst) && xclock::is_hook_running() {
-                        if !xclock::process_messages() {
-                            break;
+                    while running.load(Ordering::SeqCst) && xclock::is_running() {
+                        match xclock::message_loop() {
+                            Ok(()) => break,
+                            Err(_) => {
+                                thread::sleep(Duration::from_millis(10));
+                            }
                         }
-                        thread::sleep(Duration::from_millis(10));
                     }
                     
                     // Clean shutdown
-                    xclock::stop_clock_hook();
+                    xclock::stop_monitoring();
                     println!("Program terminated.");
                 },
                 Err(e) => {
@@ -73,12 +75,12 @@ fn main() {
         
         "stop" => {
             println!("Stopping clock hover hook...");
-            xclock::stop_clock_hook();
+            xclock::stop_monitoring();
             println!("Hook stopped.");
         },
         
         "status" => {
-            if xclock::is_hook_running() {
+            if xclock::is_running() {
                 println!("Clock hover hook is currently RUNNING");
             } else {
                 println!("Clock hover hook is currently STOPPED");
