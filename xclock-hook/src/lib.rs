@@ -226,6 +226,8 @@ unsafe extern "system" fn cbt_hook_proc(
                     }
                 }
             });
+        }else {
+            debug_logf("Not a tooltip window, class: '{0}'", &[&class_name]);
         }
     } else if code >= 0 {
         // Log other hook codes at a lower frequency
