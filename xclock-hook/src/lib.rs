@@ -146,11 +146,11 @@ unsafe fn modify_tooltip_text(hwnd: HWND) {
     }
 
     let class_name = get_window_class_name(hwnd);
-    if class_name != "tooltips_class32" {
+    if class_name != "tooltips_class32" && class_name != "Xaml_WindowedPopupClass" {
         debug_logf("Skipping window - not tooltip class. Class: '{0}'", &[&class_name]);
         return;
     }
-    debug_log("Confirmed tooltip class name");
+    debug_logf("Confirmed tooltip class name: {0}", &[&class_name]);
 
     if !is_tooltip_in_taskbar_area(hwnd) {
         debug_log("Tooltip not in taskbar area - skipping");
@@ -180,17 +180,69 @@ unsafe fn modify_tooltip_text(hwnd: HWND) {
     
     let new_text_utf16 = string_to_utf16(&new_text);
 
-    let result = SetWindowTextW(hwnd, new_text_utf16.as_ptr());
-    if result != 0 {
-        debug_log("Successfully updated tooltip text");
+    // Try different approaches based on the window class
+    let mut success = false;
+    
+    if class_name == "tooltips_class32" {
+        // Traditional tooltip - use SetWindowTextW
+        let result = SetWindowTextW(hwnd, new_text_utf16.as_ptr());
+        if result != 0 {
+            debug_log("Successfully updated traditional tooltip text");
+            success = true;
+        } else {
+            debug_logf("Failed to set window text for traditional tooltip HWND {0}", &[&(hwnd as usize)]);
+        }
+    } else if class_name == "Xaml_WindowedPopupClass" {
+        // XAML tooltip - try multiple approaches
+        
+        // Method 1: Try SetWindowTextW first
+        let result = SetWindowTextW(hwnd, new_text_utf16.as_ptr());
+        if result != 0 {
+            debug_log("Successfully updated XAML tooltip text with SetWindowTextW");
+            success = true;
+        } else {
+            debug_log("SetWindowTextW failed for XAML tooltip, trying child window approach");
+            
+            // Method 2: Try to find and update child windows
+            unsafe extern "system" fn enum_child_proc(child_hwnd: HWND, lparam: LPARAM) -> BOOL {
+                let new_text_ptr = lparam as *const Vec<u16>;
+                let new_text = &*new_text_ptr;
+                
+                let child_class = {
+                    let mut class_name = [0u16; 256];
+                    let len = GetClassNameW(child_hwnd, class_name.as_mut_ptr(), class_name.len() as i32);
+                    if len > 0 {
+                        utf16_to_string(&class_name[..len as usize])
+                    } else {
+                        String::new()
+                    }
+                };
+                
+                debug_logf("Found child window class: {0}", &[&child_class]);
+                
+                // Try to update any text-containing child windows
+                if !child_class.is_empty() {
+                    let result = SetWindowTextW(child_hwnd, new_text.as_ptr());
+                    if result != 0 {
+                        debug_logf("Successfully updated child window text for class: {0}", &[&child_class]);
+                    }
+                }
+                
+                1 // Continue enumeration
+            }
+            
+            EnumChildWindows(hwnd, Some(enum_child_proc), new_text_utf16.as_ptr() as LPARAM);
+            success = true; // Assume some success in child window updates
+        }
+    }
+    
+    if success {
         mark_tooltip_updated();
         
         // Force redraw
         InvalidateRect(hwnd, ptr::null(), 1);
         UpdateWindow(hwnd);
         debug_log("Tooltip redraw completed");
-    } else {
-        debug_logf("Failed to set window text for HWND {0}", &[&(hwnd as usize)]);
     }
 }
 
@@ -207,8 +259,8 @@ unsafe extern "system" fn cbt_hook_proc(
         
         // Check if this is a tooltip window
         let class_name = get_window_class_name(hwnd);
-        if class_name == "tooltips_class32" {
-            debug_logf("Found tooltip window creation: HWND {0}", &[&(hwnd as usize)]);
+        if class_name == "tooltips_class32" || class_name == "Xaml_WindowedPopupClass" {
+            debug_logf("Found tooltip window creation: HWND {0}, class: {1}", &[&(hwnd as usize), &class_name]);
             
             // Schedule tooltip modification after a short delay
             let hwnd_value = hwnd as usize;
